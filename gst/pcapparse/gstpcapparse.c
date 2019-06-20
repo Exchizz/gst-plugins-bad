@@ -407,7 +407,7 @@ gst_pcap_parse_scan_frame (GstPcapParse * self,
       return FALSE;
   }
 
-  if (eth_type != 0x800) {
+  if (eth_type != 0x800 && eth_type != 0x86dd) {
     GST_ERROR_OBJECT (self,
         "Link type %d: Ethernet type %d is not supported; only type 0x800",
         (gint) self->linktype, (gint) eth_type);
@@ -415,60 +415,146 @@ gst_pcap_parse_scan_frame (GstPcapParse * self,
   }
 
   b = *buf_ip;
-  if (((b >> 4) & 0x0f) != 4)
-    return FALSE;
 
-  ip_header_size = (b & 0x0f) * 4;
-  if (buf_ip + ip_header_size > buf + buf_size)
-    return FALSE;
+  /* Check that the packet is IPv4 */
+  int ip_ver = ((b >> 4) & 0x0f);
+  if (ip_ver == 4) {
 
-  ip_protocol = *(buf_ip + 9);
-  GST_LOG_OBJECT (self, "ip proto %d", (gint) ip_protocol);
-
-  if (ip_protocol != IP_PROTO_UDP && ip_protocol != IP_PROTO_TCP)
-    return FALSE;
-
-  /* ip info */
-  ip_src_addr = *((guint32 *) (buf_ip + 12));
-  ip_dst_addr = *((guint32 *) (buf_ip + 16));
-  buf_proto = buf_ip + ip_header_size;
-
-  /* ok for tcp and udp */
-  src_port = GUINT16_FROM_BE (*((guint16 *) (buf_proto + 0)));
-  dst_port = GUINT16_FROM_BE (*((guint16 *) (buf_proto + 2)));
-
-  /* extract some params and data according to protocol */
-  if (ip_protocol == IP_PROTO_UDP) {
-    len = GUINT16_FROM_BE (*((guint16 *) (buf_proto + 4)));
-    if (len < UDP_HEADER_LEN || buf_proto + len > buf + buf_size)
+    ip_header_size = (b & 0x0f) * 4;
+    if (buf_ip + ip_header_size > buf + buf_size)
       return FALSE;
 
-    *payload = buf_proto + UDP_HEADER_LEN;
-    *payload_size = len - UDP_HEADER_LEN;
+    flags = buf_ip[6] >> 5;
+    fragment_offset =
+        (GUINT16_FROM_BE (*((guint16 *) (buf_ip + 6))) & 0x1fff) * 8;
+    if (flags & 0x1 || fragment_offset > 0) {
+      GST_ERROR_OBJECT (self, "Fragmented packets are not supported");
+      return FALSE;
+    }
+
+    ip_protocol = *(buf_ip + 9);
+    GST_LOG_OBJECT (self, "ip proto %d", (gint) ip_protocol);
+
+    if (ip_protocol != IP_PROTO_UDP && ip_protocol != IP_PROTO_TCP)
+      return FALSE;
+
+    /* ip info */
+    ip_src_addr = *((guint32 *) (buf_ip + 12));
+    ip_dst_addr = *((guint32 *) (buf_ip + 16));
+    buf_proto = buf_ip + ip_header_size;
+
+    /* ok for tcp and udp */
+    src_port = GUINT16_FROM_BE (*((guint16 *) (buf_proto + 0)));
+    dst_port = GUINT16_FROM_BE (*((guint16 *) (buf_proto + 2)));
+
+    /* extract some params and data according to protocol */
+    if (ip_protocol == IP_PROTO_UDP) {
+      len = GUINT16_FROM_BE (*((guint16 *) (buf_proto + 4)));
+      if (len < UDP_HEADER_LEN || buf_proto + len > buf + buf_size)
+        return FALSE;
+
+      *payload = buf_proto + UDP_HEADER_LEN;
+      *payload_size = len - UDP_HEADER_LEN;
+    } else {
+      if (buf_proto + 12 >= buf + buf_size)
+        return FALSE;
+      len = (buf_proto[12] >> 4) * 4;
+      if (buf_proto + len > buf + buf_size)
+        return FALSE;
+
+      /* all remaining data following tcp header is payload */
+      *payload = buf_proto + len;
+      *payload_size = self->cur_packet_size - (buf_proto - buf) - len;
+    }
+
+    /* but still filter as configured */
+    if (self->src_ip >= 0 && ip_src_addr != self->src_ip)
+      return FALSE;
+
+    if (self->dst_ip >= 0 && ip_dst_addr != self->dst_ip)
+      return FALSE;
+
+    if (self->src_port >= 0 && src_port != self->src_port)
+      return FALSE;
+
+    if (self->dst_port >= 0 && dst_port != self->dst_port)
+      return FALSE;
+  } else if (ip_ver == 6) {
+    GST_LOG_OBJECT (self, "IPv6 detected");
+    int payload_type = buf_ip[6];
+    if (payload_type == IP_PROTO_UDP) {
+      GST_LOG_OBJECT (self, "UDP packet");
+
+      guint32 ipv6_dst = GUINT32_FROM_BE (*(guint32 *) (buf_ip + 24));
+      guint32 ipv6_src = GUINT32_FROM_BE (*(guint32 *) (buf_ip + 8));
+
+      guint16 ipv6_dst_port = GUINT16_FROM_BE (*(guint16 *) (buf_ip + 42));
+      guint16 ipv6_src_port = GUINT16_FROM_BE (*(guint16 *) (buf_ip + 40));
+
+      if (self->src_port >= 0 && ipv6_src_port != self->src_port)
+        return FALSE;
+
+      if (self->dst_port >= 0 && ipv6_dst_port != self->dst_port)
+        return FALSE;
+
+      GST_LOG_OBJECT (self, "dst port: %d", ipv6_dst_port);
+
+      guint8 *ipv6_dst_ip[16];
+      int i = 0;
+
+      ipv6_dst_ip[i++] = 0xff;
+      ipv6_dst_ip[i++] = 0x15;
+      ipv6_dst_ip[i++] = 0x00;
+      ipv6_dst_ip[i++] = 0x00;
+      ipv6_dst_ip[i++] = 0x00;
+      ipv6_dst_ip[i++] = 0xb8;
+      ipv6_dst_ip[i++] = 0x00;
+      ipv6_dst_ip[i++] = 0x27;
+      ipv6_dst_ip[i++] = 0x00;
+      ipv6_dst_ip[i++] = 0xeb;
+      ipv6_dst_ip[i++] = 0x00;
+      ipv6_dst_ip[i++] = 0x51;
+      ipv6_dst_ip[i++] = 0x00;
+      ipv6_dst_ip[i++] = 0xa1;
+      ipv6_dst_ip[i++] = 0x00;
+      ipv6_dst_ip[i++] = 0x58;
+
+      gboolean res = TRUE;
+
+      for (int i = 0; i < 16; i++) {
+        guint8 tmp = *(guint8 *) (buf_ip + 24 + i);
+        res = res && (ipv6_dst_ip[i] == tmp);
+      }
+      if (!res) {
+        GST_LOG_OBJECT (self, "Ignoring packet");
+        return FALSE;
+      } else {
+        GST_LOG_OBJECT (self, "Forwarding packet..");
+      }
+
+      GST_LOG_OBJECT (self, "IPv6 Dest: %X:", ipv6_dst);
+      GST_LOG_OBJECT (self, "IPv6 SRC: %X:", ipv6_src);
+
+      //59 + 60
+      //int payload_size = buf_ip[37];
+      buf_proto = buf_ip + 40;
+      guint16 ip_payload_length = GUINT16_FROM_BE (*(guint16 *) (buf_ip + 4));
+      *payload_size =
+          GUINT16_FROM_BE (*(guint16 *) (buf_proto + 4)) - UDP_HEADER_LEN;
+      *payload = buf_proto + UDP_HEADER_LEN;
+
+      GST_LOG_OBJECT (self, "size: %X, %d", ip_payload_length,
+          ip_payload_length);
+
+
+    } else {
+      GST_ERROR_OBJECT (self, "TCP packet not implemented yet");
+      return FALSE;
+    }
   } else {
-    if (buf_proto + 12 >= buf + buf_size)
-      return FALSE;
-    len = (buf_proto[12] >> 4) * 4;
-    if (buf_proto + len > buf + buf_size)
-      return FALSE;
-
-    /* all remaining data following tcp header is payload */
-    *payload = buf_proto + len;
-    *payload_size = self->cur_packet_size - (buf_proto - buf) - len;
+    GST_ERROR_OBJECT (self,
+        "Unsupported IPvX version. Only 4 and 6 are supported");
   }
-
-  /* but still filter as configured */
-  if (self->src_ip >= 0 && ip_src_addr != self->src_ip)
-    return FALSE;
-
-  if (self->dst_ip >= 0 && ip_dst_addr != self->dst_ip)
-    return FALSE;
-
-  if (self->src_port >= 0 && src_port != self->src_port)
-    return FALSE;
-
-  if (self->dst_port >= 0 && dst_port != self->dst_port)
-    return FALSE;
 
   return TRUE;
 }
@@ -538,6 +624,7 @@ gst_pcap_parse_chain (GstPad * pad, GstObject * parent, GstBuffer * buffer)
           } else {
             gst_adapter_unmap (self->adapter);
             gst_adapter_flush (self->adapter, self->cur_packet_size);
+            //GST_ELEMENT_ERROR (self, STREAM, WRONG_TYPE, (NULL),("P1 - returns false"));
           }
         }
 

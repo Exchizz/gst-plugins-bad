@@ -70,7 +70,9 @@ enum
   PROP_SRC_PORT,
   PROP_DST_PORT,
   PROP_CAPS,
-  PROP_TS_OFFSET
+  PROP_TS_OFFSET,
+  PROP_SKIP_TO_SEC,
+  PROP_DURATION
 };
 
 GST_DEBUG_CATEGORY_STATIC (gst_pcap_parse_debug);
@@ -145,6 +147,16 @@ gst_pcap_parse_class_init (GstPcapParseClass * klass)
           "Relative timestamp offset (ns) to apply (-1 = use absolute packet time)",
           -1, G_MAXINT64, -1, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (gobject_class, PROP_SKIP_TO_SEC,
+      g_param_spec_uint64 ("skip-to-sec", "Skip to sec",
+          "Skip X seconds into pcap file since linux epoch",
+          0, G_MAXINT64, 0, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_DURATION,
+      g_param_spec_int ("duration", "Duration",
+          "Play X seconds of pcap file",
+          -1, G_MAXUINT16, -1, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   gst_element_class_add_static_pad_template (element_class, &sink_template);
   gst_element_class_add_static_pad_template (element_class, &src_template);
 
@@ -173,11 +185,16 @@ gst_pcap_parse_init (GstPcapParse * self)
   gst_pad_use_fixed_caps (self->src_pad);
   gst_element_add_pad (GST_ELEMENT (self), self->src_pad);
 
-  self->src_ip = -1;
-  self->dst_ip = -1;
   self->src_port = -1;
   self->dst_port = -1;
+  self->skip_to_sec = 0;
+  self->src_ipv6_is_set = FALSE;
+  self->dst_ipv6_is_set = FALSE;
+  self->src_ipv4_is_set = FALSE;
+  self->dst_ipv4_is_set = FALSE;
   self->offset = -1;
+  self->duration = -1;
+  self->duration_playto = -1;
 
   self->adapter = gst_adapter_new ();
 
@@ -208,16 +225,22 @@ get_ip_address_as_string (gint64 ip_addr)
   }
 }
 
-static void
-set_ip_address_from_string (gint64 * ip_addr, const gchar * ip_str)
+static gboolean
+set_ipv6_address_from_string_if_valid (struct in6_addr *ip6_addr,
+    const gchar * ip6_str)
 {
-  if (ip_str[0] != '\0') {
-    gulong addr = inet_addr (ip_str);
-    if (addr != INADDR_NONE)
-      *ip_addr = addr;
-  } else {
-    *ip_addr = -1;
-  }
+  gboolean retval;
+  retval = inet_pton (AF_INET6, ip6_str, ip6_addr);
+  return retval;
+}
+
+static gboolean
+set_ipv4_address_from_string_if_valid (struct in_addr *ip4_addr,
+    const gchar * ip4_str)
+{
+  gboolean retval;
+  retval = inet_pton (AF_INET, ip4_str, ip4_addr);
+  return retval;
 }
 
 static void
@@ -228,11 +251,11 @@ gst_pcap_parse_get_property (GObject * object, guint prop_id,
 
   switch (prop_id) {
     case PROP_SRC_IP:
-      g_value_set_string (value, get_ip_address_as_string (self->src_ip));
+      //g_value_set_string (value,get_ip_address_as_string (self->src_ip));
       break;
 
     case PROP_DST_IP:
-      g_value_set_string (value, get_ip_address_as_string (self->dst_ip));
+      //g_value_set_string (value, get_ip_address_as_string (self->dst_ip));
       break;
 
     case PROP_SRC_PORT:
@@ -250,6 +273,12 @@ gst_pcap_parse_get_property (GObject * object, guint prop_id,
     case PROP_TS_OFFSET:
       g_value_set_int64 (value, self->offset);
       break;
+    case PROP_SKIP_TO_SEC:
+      g_value_set_uint64 (value, self->skip_to_sec);
+      break;
+    case PROP_DURATION:
+      g_value_set_int (value, self->duration);
+      break;
 
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -265,11 +294,27 @@ gst_pcap_parse_set_property (GObject * object, guint prop_id,
 
   switch (prop_id) {
     case PROP_SRC_IP:
-      set_ip_address_from_string (&self->src_ip, g_value_get_string (value));
+      if (set_ipv6_address_from_string_if_valid (&self->src_ipv6,
+              g_value_get_string (value))) {
+        self->src_ipv6_is_set = TRUE;
+      }
+
+      if (set_ipv4_address_from_string_if_valid (&self->src_ipv4,
+              g_value_get_string (value))) {
+        self->src_ipv4_is_set = TRUE;
+      }
       break;
 
     case PROP_DST_IP:
-      set_ip_address_from_string (&self->dst_ip, g_value_get_string (value));
+      if (set_ipv6_address_from_string_if_valid (&self->dst_ipv6,
+              g_value_get_string (value))) {
+        self->dst_ipv6_is_set = TRUE;
+      }
+
+      if (set_ipv4_address_from_string_if_valid (&self->dst_ipv4,
+              g_value_get_string (value))) {
+        self->dst_ipv4_is_set = TRUE;
+      }
       break;
 
     case PROP_SRC_PORT:
@@ -305,6 +350,14 @@ gst_pcap_parse_set_property (GObject * object, guint prop_id,
       self->offset = g_value_get_int64 (value);
       break;
 
+    case PROP_SKIP_TO_SEC:
+      self->skip_to_sec = g_value_get_uint64 (value) * GST_SECOND;
+      break;
+
+    case PROP_DURATION:
+      self->duration = g_value_get_int (value);
+      break;
+
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -321,6 +374,7 @@ gst_pcap_parse_reset (GstPcapParse * self)
   self->cur_ts = GST_CLOCK_TIME_NONE;
   self->base_ts = GST_CLOCK_TIME_NONE;
   self->newsegment_sent = FALSE;
+  self->duration_playto = GST_CLOCK_TIME_NONE;
 
   gst_adapter_clear (self->adapter);
 }
@@ -352,6 +406,21 @@ gst_pcap_parse_read_uint32 (GstPcapParse * self, const guint8 * p)
 #define IP_PROTO_TCP      6
 
 
+static void
+stop_playing (GstPcapParse * self)
+{
+  GST_ERROR_OBJECT (self, "Stopping, duration reached");
+
+
+  GstEvent *event;
+  gboolean result;
+
+  event = gst_event_new_eos ();
+  result = gst_element_send_event (self, event);
+  //exit(0);
+}
+
+
 static gboolean
 gst_pcap_parse_scan_frame (GstPcapParse * self,
     const guint8 * buf,
@@ -361,10 +430,17 @@ gst_pcap_parse_scan_frame (GstPcapParse * self,
   const guint8 *buf_proto;
   guint16 eth_type;
   guint8 b;
+  guint8 ip_ver;
   guint8 ip_header_size;
+  guint8 flags;
+  guint16 fragment_offset;
   guint8 ip_protocol;
-  guint32 ip_src_addr;
-  guint32 ip_dst_addr;
+  //guint32 ip_src_addr;
+  //guint32 ip_dst_addr;
+  struct in_addr ipv4_dst;
+  struct in_addr ipv4_src;
+  struct in6_addr ipv6_dst;
+  struct in6_addr ipv6_src;
   guint16 src_port;
   guint16 dst_port;
   guint16 len;
@@ -406,10 +482,10 @@ gst_pcap_parse_scan_frame (GstPcapParse * self,
     default:
       return FALSE;
   }
-
+  /* if Iv4 og IPV6 */
   if (eth_type != 0x800 && eth_type != 0x86dd) {
     GST_ERROR_OBJECT (self,
-        "Link type %d: Ethernet type %d is not supported; only type 0x800",
+        "Link type %d: Ethernet type %X is not supported; only type 0x800 or 0x86dd",
         (gint) self->linktype, (gint) eth_type);
     return FALSE;
   }
@@ -417,7 +493,7 @@ gst_pcap_parse_scan_frame (GstPcapParse * self,
   b = *buf_ip;
 
   /* Check that the packet is IPv4 */
-  int ip_ver = ((b >> 4) & 0x0f);
+  ip_ver = ((b >> 4) & 0x0f);
   if (ip_ver == 4) {
 
     ip_header_size = (b & 0x0f) * 4;
@@ -433,14 +509,13 @@ gst_pcap_parse_scan_frame (GstPcapParse * self,
     }
 
     ip_protocol = *(buf_ip + 9);
-    GST_LOG_OBJECT (self, "ip proto %d", (gint) ip_protocol);
 
     if (ip_protocol != IP_PROTO_UDP && ip_protocol != IP_PROTO_TCP)
       return FALSE;
 
     /* ip info */
-    ip_src_addr = *((guint32 *) (buf_ip + 12));
-    ip_dst_addr = *((guint32 *) (buf_ip + 16));
+    ipv4_dst = *(struct in_addr *) (buf_ip + 12);
+    ipv4_src = *(struct in_addr *) (buf_ip + 16);
     buf_proto = buf_ip + ip_header_size;
 
     /* ok for tcp and udp */
@@ -466,89 +541,65 @@ gst_pcap_parse_scan_frame (GstPcapParse * self,
       *payload = buf_proto + len;
       *payload_size = self->cur_packet_size - (buf_proto - buf) - len;
     }
-
     /* but still filter as configured */
-    if (self->src_ip >= 0 && ip_src_addr != self->src_ip)
-      return FALSE;
 
-    if (self->dst_ip >= 0 && ip_dst_addr != self->dst_ip)
+    if (self->src_ipv4_is_set
+        && !memcmp (&self->src_ipv4, &ipv4_src, sizeof (struct in_addr)) == 0) {
       return FALSE;
+    }
+
+    if (self->dst_ipv4_is_set
+        && !memcmp (&self->dst_ipv4, &ipv4_dst, sizeof (struct in_addr)) == 0) {
+      return FALSE;
+    }
 
     if (self->src_port >= 0 && src_port != self->src_port)
       return FALSE;
 
     if (self->dst_port >= 0 && dst_port != self->dst_port)
       return FALSE;
+
   } else if (ip_ver == 6) {
-    GST_LOG_OBJECT (self, "IPv6 detected");
+    /* extract some params and data according to protocol */
     int payload_type = buf_ip[6];
     if (payload_type == IP_PROTO_UDP) {
-      GST_LOG_OBJECT (self, "UDP packet");
 
-      guint32 ipv6_dst = GUINT32_FROM_BE (*(guint32 *) (buf_ip + 24));
-      guint32 ipv6_src = GUINT32_FROM_BE (*(guint32 *) (buf_ip + 8));
+      ipv6_dst = *(struct in6_addr *) (buf_ip + 24);
+      ipv6_src = *(struct in6_addr *) (buf_ip + 8);
 
-      guint16 ipv6_dst_port = GUINT16_FROM_BE (*(guint16 *) (buf_ip + 42));
-      guint16 ipv6_src_port = GUINT16_FROM_BE (*(guint16 *) (buf_ip + 40));
+      dst_port = GUINT16_FROM_BE (*(guint16 *) (buf_ip + 42));
+      src_port = GUINT16_FROM_BE (*(guint16 *) (buf_ip + 40));
 
-      if (self->src_port >= 0 && ipv6_src_port != self->src_port)
+      if (self->src_port >= 0 && src_port != self->src_port) {
         return FALSE;
-
-      if (self->dst_port >= 0 && ipv6_dst_port != self->dst_port)
-        return FALSE;
-
-      GST_LOG_OBJECT (self, "dst port: %d", ipv6_dst_port);
-
-      guint8 *ipv6_dst_ip[16];
-      int i = 0;
-
-      ipv6_dst_ip[i++] = 0xff;
-      ipv6_dst_ip[i++] = 0x15;
-      ipv6_dst_ip[i++] = 0x00;
-      ipv6_dst_ip[i++] = 0x00;
-      ipv6_dst_ip[i++] = 0x00;
-      ipv6_dst_ip[i++] = 0xb8;
-      ipv6_dst_ip[i++] = 0x00;
-      ipv6_dst_ip[i++] = 0x27;
-      ipv6_dst_ip[i++] = 0x00;
-      ipv6_dst_ip[i++] = 0xeb;
-      ipv6_dst_ip[i++] = 0x00;
-      ipv6_dst_ip[i++] = 0x51;
-      ipv6_dst_ip[i++] = 0x00;
-      ipv6_dst_ip[i++] = 0xa1;
-      ipv6_dst_ip[i++] = 0x00;
-      ipv6_dst_ip[i++] = 0x58;
-
-      gboolean res = TRUE;
-
-      for (int i = 0; i < 16; i++) {
-        guint8 tmp = *(guint8 *) (buf_ip + 24 + i);
-        res = res && (ipv6_dst_ip[i] == tmp);
-      }
-      if (!res) {
-        GST_LOG_OBJECT (self, "Ignoring packet");
-        return FALSE;
-      } else {
-        GST_LOG_OBJECT (self, "Forwarding packet..");
       }
 
-      GST_LOG_OBJECT (self, "IPv6 Dest: %X:", ipv6_dst);
-      GST_LOG_OBJECT (self, "IPv6 SRC: %X:", ipv6_src);
+      if (self->dst_port >= 0 && dst_port != self->dst_port) {
+        return FALSE;
+      }
 
-      //59 + 60
-      //int payload_size = buf_ip[37];
+      if (self->dst_ipv6_is_set
+          && !memcmp (&self->dst_ipv6, &ipv6_dst,
+              sizeof (struct in6_addr)) == 0) {
+        // GST_DEBUG_OBJECT (self, "Drop ipv6 dst");
+        return FALSE;
+      }
+      if (self->src_ipv6_is_set
+          && !memcmp (&self->src_ipv6, &ipv6_src,
+              sizeof (struct in6_addr)) == 0) {
+        //  GST_DEBUG_OBJECT (self, "Drop ipv6 src");
+        return FALSE;
+      }
+
       buf_proto = buf_ip + 40;
-      guint16 ip_payload_length = GUINT16_FROM_BE (*(guint16 *) (buf_ip + 4));
+
       *payload_size =
           GUINT16_FROM_BE (*(guint16 *) (buf_proto + 4)) - UDP_HEADER_LEN;
       *payload = buf_proto + UDP_HEADER_LEN;
 
-      GST_LOG_OBJECT (self, "size: %X, %d", ip_payload_length,
-          ip_payload_length);
-
 
     } else {
-      GST_ERROR_OBJECT (self, "TCP packet not implemented yet");
+      GST_ERROR_OBJECT (self, "TCP not implemented yet");
       return FALSE;
     }
   } else {
@@ -585,10 +636,15 @@ gst_pcap_parse_chain (GstPad * pad, GstObject * parent, GstBuffer * buffer)
 
           data = gst_adapter_map (self->adapter, self->cur_packet_size);
 
-          GST_LOG_OBJECT (self, "examining packet size %" G_GINT64_FORMAT,
-              self->cur_packet_size);
 
-          if (gst_pcap_parse_scan_frame (self, data, self->cur_packet_size,
+          GST_ERROR_OBJECT (self, "time: %u", self->cur_ts / GST_SECOND);
+
+          if (self->duration_playto <= self->cur_ts) {
+            stop_playing (self);
+          }
+
+          if (self->cur_ts >= self->skip_to_sec
+              && gst_pcap_parse_scan_frame (self, data, self->cur_packet_size,
                   &payload_data, &payload_size)) {
             GstBuffer *out_buf;
             guintptr offset = payload_data - data;
@@ -607,6 +663,15 @@ gst_pcap_parse_chain (GstPad * pad, GstObject * parent, GstBuffer * buffer)
             gst_adapter_flush (self->adapter,
                 self->cur_packet_size - offset - payload_size);
 
+            // If the duration parameter is set, set duration_playto
+            if (!GST_CLOCK_TIME_IS_VALID (self->duration_playto)
+                && self->duration > 0) {
+              self->duration_playto =
+                  self->cur_ts + self->duration * GST_SECOND;
+              GST_ERROR_OBJECT (self, "durationplayback: %u",
+                  self->duration_playto / GST_SECOND);
+            }
+
             if (GST_CLOCK_TIME_IS_VALID (self->cur_ts)) {
               if (!GST_CLOCK_TIME_IS_VALID (self->base_ts))
                 self->base_ts = self->cur_ts;
@@ -615,6 +680,7 @@ gst_pcap_parse_chain (GstPad * pad, GstObject * parent, GstBuffer * buffer)
                 self->cur_ts += self->offset;
               }
             }
+
             GST_BUFFER_TIMESTAMP (out_buf) = self->cur_ts;
 
 
@@ -630,6 +696,7 @@ gst_pcap_parse_chain (GstPad * pad, GstObject * parent, GstBuffer * buffer)
 
         self->cur_packet_size = -1;
       } else {
+
         guint32 ts_sec;
         guint32 ts_usec;
         guint32 incl_len;
@@ -709,15 +776,15 @@ gst_pcap_parse_chain (GstPad * pad, GstObject * parent, GstBuffer * buffer)
       self->initialized = TRUE;
     }
   }
-
   if (list) {
-    if (!self->newsegment_sent && GST_CLOCK_TIME_IS_VALID (self->cur_ts)) {
+    if (!self->newsegment_sent && GST_CLOCK_TIME_IS_VALID (self->base_ts)) {
       GstSegment segment;
 
       if (self->caps)
         gst_pad_set_caps (self->src_pad, self->caps);
       gst_segment_init (&segment, GST_FORMAT_TIME);
       segment.start = self->base_ts;
+
       gst_pad_push_event (self->src_pad, gst_event_new_segment (&segment));
       self->newsegment_sent = TRUE;
     }

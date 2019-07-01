@@ -22,6 +22,7 @@
 
 #include <gst/gst.h>
 #include <gst/base/gstadapter.h>
+#include <netinet/in.h>
 
 G_BEGIN_DECLS
 
@@ -67,12 +68,15 @@ struct _GstPcapParse
   GstPad * src_pad;
 
   /* properties */
-  gint64 src_ip;
-  gint64 dst_ip;
+  //gint64 src_ip;
+  //gint64 dst_ip;
   gint32 src_port;
   gint32 dst_port;
   GstCaps *caps;
   gint64 offset;
+  gint64 duration;
+  gint64 duration_playto;
+  guint32 skip_to_sec;
 
   /* state */
   GstAdapter * adapter;
@@ -83,6 +87,14 @@ struct _GstPcapParse
   GstClockTime cur_ts;
   GstClockTime base_ts;
   GstPcapParseLinktype linktype;
+  gboolean src_ipv6_is_set;
+  gboolean dst_ipv6_is_set;
+  gboolean src_ipv4_is_set;
+  gboolean dst_ipv4_is_set;
+  struct in_addr src_ipv4;
+  struct in_addr dst_ipv4;
+  struct in6_addr src_ipv6;
+  struct in6_addr dst_ipv6;
 
   gboolean newsegment_sent;
 };

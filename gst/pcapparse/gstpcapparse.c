@@ -562,6 +562,8 @@ gst_pcap_parse_scan_frame (GstPcapParse * self,
   } else if (ip_ver == 6) {
     /* extract some params and data according to protocol */
     int payload_type = buf_ip[6];
+    if (payload_type != IP_PROTO_UDP && payload_type != IP_PROTO_TCP)
+      return FALSE;
     if (payload_type == IP_PROTO_UDP) {
 
       ipv6_dst = *(struct in6_addr *) (buf_ip + 24);
@@ -637,7 +639,7 @@ gst_pcap_parse_chain (GstPad * pad, GstObject * parent, GstBuffer * buffer)
           data = gst_adapter_map (self->adapter, self->cur_packet_size);
 
 
-          GST_ERROR_OBJECT (self, "time: %u", self->cur_ts / GST_SECOND);
+          GST_INFO_OBJECT (self, "time: %lu", self->cur_ts);
 
           if (self->duration_playto <= self->cur_ts) {
             stop_playing (self);
